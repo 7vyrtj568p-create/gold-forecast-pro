@@ -1,154 +1,392 @@
-
-import os, math, re
-from datetime import datetime
-import pandas as pd
-import numpy as np
+import os
+import requests
 import streamlit as st
 
-st.set_page_config(page_title="Gold Forecast Pro", page_icon="🪙", layout="wide")
+st.set_page_config(
+    page_title="Gold Forecast Pro — ایران",
+    page_icon="🪙",
+    layout="wide"
+)
 
-# ---------- Helpers ----------
-def gold18(ounce, usd_irr):
-    return ounce * usd_irr / 31.1034768 * 0.75
+API_URL = "https://api.oanor.com/irr-api/v1/gold"
 
-def fmt_rial(x):
-    return f"{x:,.0f} ریال"
 
-def fmt_toman(x):
-    return f"{x/10:,.0f} تومان"
+def fmt_rial(value):
+    return f"{value:,.0f} ریال"
 
-def news_score(text):
-    positive = ["جنگ","حمله","تحریم","تنش","بحران","نااطمینانی","درگیری","موشک",
-                "war","attack","sanction","tension","crisis","uncertainty","conflict","missile"]
-    negative = ["آتش بس","صلح","مذاکره","توافق","کاهش تنش","پایان جنگ",
-                "ceasefire","peace","talks","deal","de-escalation"]
-    t = str(text).lower()
-    p = sum(t.count(x.lower()) for x in positive)
-    n = sum(t.count(x.lower()) for x in negative)
-    return 0 if p+n == 0 else max(-1, min(1, (p-n)/(p+n)))
 
-def model(base_oz, base_usd, target_oz, target_usd, sentiment, premium):
-    raw = gold18(target_oz, target_usd)
-    # News has a bounded influence; it is not allowed to dominate fundamentals.
-    news_adj = 1 + sentiment * 0.08
-    return raw * news_adj * (1 + premium)
+def fmt_toman(value):
+    return f"{value / 10:,.0f} تومان"
 
-# ---------- Header ----------
+
+def get_api_key():
+    try:
+        return st.secrets["OANOR_API_KEY"]
+    except Exception:
+        return os.getenv("OANOR_API_KEY", "")
+
+
+def fetch_market_data():
+    api_key = get_api_key()
+
+    if not api_key:
+        raise RuntimeError(
+            "کلید OANOR_API_KEY در Streamlit Secrets پیدا نشد."
+        )
+
+    headers = {
+        "x-oanor-key": api_key,
+        "Accept": "application/json",
+    }
+
+    response = requests.get(
+        API_URL,
+        headers=headers,
+        timeout=20
+    )
+
+    if response.status_code == 401:
+        raise RuntimeError("کلید API نامعتبر یا منقضی است.")
+
+    if response.status_code == 429:
+        raise RuntimeError(
+            "سقف درخواست API پر شده است. کمی بعد دوباره امتحان کنید."
+        )
+
+    response.raise_for_status()
+
+    return response.json()
+
+
+def find_number(data, possible_keys):
+    """
+    پیدا کردن عدد در پاسخ API حتی اگر ساختار JSON تو در تو باشد.
+    """
+
+    if isinstance(data, dict):
+
+        # اول کلیدهای مورد انتظار را بررسی می‌کنیم
+        for key in possible_keys:
+            if key in data:
+                value = data[key]
+
+                if isinstance(value, (int, float)):
+                    return float(value)
+
+                if isinstance(value, str):
+                    try:
+                        return float(
+                            value.replace(",", "").replace(" ", "")
+                        )
+                    except Exception:
+                        pass
+
+        # سپس داخل آبجکت‌های تو در تو می‌گردیم
+        for value in data.values():
+            result = find_number(value, possible_keys)
+
+            if result is not None:
+                return result
+
+    elif isinstance(data, list):
+
+        for item in data:
+            result = find_number(item, possible_keys)
+
+            if result is not None:
+                return result
+
+    return None
+
+
+def calculate_gold18(ounce_usd, usd_irr):
+    """
+    تبدیل اونس جهانی و دلار به ارزش بنیادی طلای ۱۸ عیار
+    """
+
+    return (
+        ounce_usd
+        * usd_irr
+        / 31.1034768
+        * 0.75
+    )
+
+
+# ---------------------------------------------------------
+# HEADER
+# ---------------------------------------------------------
+
 st.title("🪙 Gold Forecast Pro — ایران")
-st.caption("داشبورد تحلیلی طلای ۱۸ عیار؛ بازار، دلار، اونس و اخبار را در یک مدل سناریویی ترکیب می‌کند.")
 
-with st.sidebar:
-    st.header("ورودی بازار")
-    ounce = st.number_input("اونس جهانی (USD)", 500.0, 10000.0, 4380.0, 10.0)
-    usd = st.number_input("دلار آزاد (ریال)", 100000.0, 10000000.0, 2279000.0, 10000.0)
-    current = st.number_input("طلای ۱۸ عیار فعلی (ریال/گرم)", 10000000.0, 1000000000.0, 233600000.0, 1000000.0)
-    premium = st.slider("پریمیوم/حباب داخلی", -0.15, 0.25, 0.0, 0.005)
+st.caption(
+    "داشبورد زنده تحلیل طلای ۱۸ عیار ایران "
+    "با استفاده از داده بازار"
+)
 
-st.markdown("### وضعیت بنیادی فعلی")
-fundamental = gold18(ounce, usd)
-a,b,c,d = st.columns(4)
-a.metric("ارزش بنیادی", fmt_rial(fundamental))
-b.metric("قیمت بازار", fmt_rial(current))
-c.metric("اختلاف", f"{(current/fundamental-1)*100:+.1f}%")
-d.metric("دلار", fmt_toman(usd))
 
-# ---------- News ----------
-st.markdown("### 📰 موتور اخبار")
-tab1, tab2 = st.tabs(["ورود دستی خبرها", "CSV خبرها"])
+# ---------------------------------------------------------
+# REFRESH
+# ---------------------------------------------------------
 
-with tab1:
-    news_text = st.text_area("خبرها را وارد کن؛ هر خبر در یک خط", height=180,
-        placeholder="مثال: افزایش تنش در خاورمیانه...\nمثال: مذاکرات برای آتش‌بس...")
-    if news_text.strip():
-        items = [x.strip() for x in news_text.splitlines() if x.strip()]
-        scores = [news_score(x) for x in items]
-        avg = float(np.mean(scores))
-        label = "صعودی" if avg > .15 else "نزولی" if avg < -.15 else "خنثی"
-        st.metric("سیگنال اخبار", f"{label} ({avg:+.2f})")
-        nd = pd.DataFrame({"خبر": items, "امتیاز": scores})
-        st.dataframe(nd, use_container_width=True, hide_index=True)
-    else:
-        avg = 0.0
+if st.button("🔄 بروزرسانی قیمت‌ها", type="primary"):
+    st.cache_data.clear()
+    st.rerun()
 
-with tab2:
-    uploaded = st.file_uploader("CSV با ستون text", type=["csv"])
-    if uploaded:
-        ndf = pd.read_csv(uploaded)
-        if "text" not in ndf.columns:
-            st.error("فایل باید ستونی به نام text داشته باشد.")
+
+# ---------------------------------------------------------
+# LOAD DATA
+# ---------------------------------------------------------
+
+try:
+
+    market = fetch_market_data()
+
+    # نام‌های احتمالی فیلدها
+    ounce = find_number(
+        market,
+        [
+            "ounce",
+            "gold_ounce",
+            "global_ounce",
+            "xau_usd",
+            "xau",
+            "ons",
+            "oz"
+        ]
+    )
+
+    gold18 = find_number(
+        market,
+        [
+            "gold18",
+            "gold_18",
+            "gold_18k",
+            "gram18",
+            "18k",
+            "gold_gram_18"
+        ]
+    )
+
+    gold24 = find_number(
+        market,
+        [
+            "gold24",
+            "gold_24",
+            "gold_24k",
+            "gram24",
+            "24k",
+            "gold_gram_24"
+        ]
+    )
+
+
+    # -----------------------------------------------------
+    # دلار
+    # -----------------------------------------------------
+
+    usd = None
+
+    try:
+
+        currency_url = (
+            "https://api.oanor.com/irr-api/v1/currencies"
+        )
+
+        headers = {
+            "x-oanor-key": get_api_key(),
+            "Accept": "application/json",
+        }
+
+        currency_response = requests.get(
+            currency_url,
+            headers=headers,
+            timeout=20
+        )
+
+        if currency_response.ok:
+
+            currencies = currency_response.json()
+
+            usd = find_number(
+                currencies,
+                [
+                    "USD",
+                    "usd",
+                    "usd_irr",
+                    "usd_rate",
+                    "dollar",
+                    "dollar_rate",
+                    "USDT"
+                ]
+            )
+
+    except Exception:
+        usd = None
+
+
+    # -----------------------------------------------------
+    # METRICS
+    # -----------------------------------------------------
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+
+        if ounce is not None:
+            st.metric(
+                "🌍 اونس جهانی",
+                f"${ounce:,.2f}"
+            )
         else:
-            ndf["score"] = ndf["text"].map(news_score)
-            avg = float(ndf["score"].mean())
-            st.dataframe(ndf, use_container_width=True, hide_index=True)
+            st.metric(
+                "🌍 اونس جهانی",
+                "دریافت نشد"
+            )
 
-# ---------- Forecast ----------
-st.markdown("### 📈 پیش‌بینی سناریویی")
-st.caption("این بخش سناریو می‌سازد؛ برای پیش‌بینی آماری واقعی، باید تاریخچه چندساله قیمت و خبر به مدل آموزش داده شود.")
 
-scenarios = {
-    "نزولی": (4200, 2150000),
-    "پایه": (4400, 2300000),
-    "صعودی": (4800, 2700000),
-}
-rows = []
-for name,(oz,du) in scenarios.items():
-    value = model(ounce, usd, oz, du, avg, premium)
-    rows.append([name, oz, du, value, (value/current-1)*100])
+    with col2:
 
-fdf = pd.DataFrame(rows, columns=["سناریو","اونس هدف","دلار هدف (ریال)","طلای ۱۸ (ریال/گرم)","تغییر نسبت به امروز"])
-st.dataframe(fdf.style.format({
-    "اونس هدف":"{:.0f}",
-    "دلار هدف (ریال)":"{:,.0f}",
-    "طلای ۱۸ (ریال/گرم)":"{:,.0f}",
-    "تغییر نسبت به امروز":"{:+.1f}%"
-}), use_container_width=True, hide_index=True)
+        if usd is not None:
+            st.metric(
+                "💵 دلار",
+                fmt_rial(usd)
+            )
+        else:
+            st.metric(
+                "💵 دلار",
+                "دریافت نشد"
+            )
 
-# ---------- Custom forecast ----------
-st.markdown("### 🎯 پیش‌بینی سفارشی")
-x,y,z = st.columns(3)
-with x:
-    target_oz = st.number_input("اونس هدف", 1000.0, 10000.0, 4600.0, 25.0)
-with y:
-    target_usd = st.number_input("دلار هدف (ریال)", 100000.0, 20000000.0, 2600000.0, 10000.0)
-with z:
-    horizon = st.selectbox("افق", ["۷ روز","۳۰ روز","۶۰ روز","۹۰ روز"])
 
-custom = model(ounce, usd, target_oz, target_usd, avg, premium)
-cc1,cc2,cc3 = st.columns(3)
-cc1.metric("طلای ۱۸ عیار", fmt_rial(custom))
-cc2.metric("به تومان", fmt_toman(custom))
-cc3.metric("تغییر", f"{(custom/current-1)*100:+.1f}%")
+    with col3:
 
-# ---------- Backtest upload ----------
-st.markdown("### 🧪 Backtest / ارزیابی مدل")
-hist = st.file_uploader("CSV اختیاری: date, ounce, usd_irr, actual_gold18", type=["csv"], key="hist")
-if hist:
-    h = pd.read_csv(hist)
-    required = {"date","ounce","usd_irr","actual_gold18"}
-    if not required.issubset(h.columns):
-        st.error("ستون‌های لازم: date, ounce, usd_irr, actual_gold18")
+        if gold18 is not None:
+            st.metric(
+                "🟡 طلای ۱۸ عیار",
+                fmt_rial(gold18)
+            )
+        else:
+            st.metric(
+                "🟡 طلای ۱۸ عیار",
+                "دریافت نشد"
+            )
+
+
+    # -----------------------------------------------------
+    # FUNDAMENTAL VALUE
+    # -----------------------------------------------------
+
+    st.divider()
+
+    st.header("📊 وضعیت بنیادی طلا")
+
+
+    if ounce is not None and usd is not None:
+
+        fundamental = calculate_gold18(
+            ounce,
+            usd
+        )
+
+        st.metric(
+            "ارزش بنیادی طلای ۱۸ عیار",
+            fmt_rial(fundamental),
+            fmt_toman(fundamental)
+        )
+
+
+        if gold18 is not None and fundamental > 0:
+
+            difference = (
+                gold18 / fundamental
+            ) - 1
+
+            st.write(
+                f"فاصله قیمت بازار از ارزش بنیادی: "
+                f"**{difference:+.2%}**"
+            )
+
+            if difference > 0:
+
+                st.info(
+                    "قیمت بازار بالاتر از ارزش محاسباتی بنیادی است."
+                )
+
+            elif difference < 0:
+
+                st.info(
+                    "قیمت بازار پایین‌تر از ارزش محاسباتی بنیادی است."
+                )
+
+            else:
+
+                st.info(
+                    "قیمت بازار تقریباً برابر ارزش بنیادی است."
+                )
+
     else:
-        h["predicted"] = gold18(h["ounce"], h["usd_irr"])
-        h["error_pct"] = (h["predicted"]/h["actual_gold18"]-1)*100
-        mae = h["error_pct"].abs().mean()
-        rmse = math.sqrt(np.mean(h["error_pct"]**2))
-        q1,q2 = st.columns(2)
-        q1.metric("MAE درصدی", f"{mae:.2f}%")
-        q2.metric("RMSE درصدی", f"{rmse:.2f}%")
-        st.line_chart(h.set_index("date")[["actual_gold18","predicted"]])
 
-# ---------- Architecture ----------
-with st.expander("⚙️ اتصال خودکار داده‌ها در نسخه تولیدی"):
-    st.markdown("""
-برای نسخه آنلاین واقعی، این داشبورد باید به APIهای مجاز متصل شود:
-- XAU/USD و USD/IRR
-- طلای ۱۸ عیار ایران
-- اخبار دارای مجوز (مثلاً Reuters/LSEG یا سایر تأمین‌کنندگان مجاز)
-- ذخیره تاریخچه در PostgreSQL
-- زمان‌بندی دریافت داده با worker
-- مدل ML با walk-forward validation
+        st.warning(
+            "برای محاسبه ارزش بنیادی، "
+            "اونس و دلار باید از API دریافت شوند."
+        )
 
-کلیدهای API را داخل کد قرار نده؛ از environment variables یا secrets استفاده کن.
-""")
 
-st.warning("خروجی این برنامه برآورد سناریویی است و توصیه خرید یا فروش نیست. در شوک‌های جنگی، خطای مدل می‌تواند به‌طور محسوسی افزایش یابد.")
+    # -----------------------------------------------------
+    # GOLD 24
+    # -----------------------------------------------------
+
+    if gold24 is not None:
+
+        st.subheader("طلای ۲۴ عیار")
+
+        st.write(
+            fmt_rial(gold24)
+        )
+
+
+    # -----------------------------------------------------
+    # RAW DATA
+    # -----------------------------------------------------
+
+    with st.expander("🔎 مشاهده داده خام API"):
+
+        st.json(market)
+
+
+except Exception as error:
+
+    st.error(
+        f"خطا در دریافت اطلاعات بازار: {error}"
+    )
+
+    st.info(
+        "بررسی کنید OANOR_API_KEY در "
+        "Streamlit → Settings → Secrets "
+        "ذخیره شده باشد."
+    )
+
+
+# ---------------------------------------------------------
+# NEWS
+# ---------------------------------------------------------
+
+st.divider()
+
+st.header("📰 موتور اخبار")
+
+st.info(
+    "اتصال خودکار اخبار در مرحله بعد اضافه می‌شود. "
+    "پس از تأیید عملکرد داده‌های بازار، "
+    "منابع خبری معتبر و تحلیل اثر اخبار را اضافه می‌کنیم."
+)
+
+
+# ---------------------------------------------------------
+# DISCLAIMER
+# ---------------------------------------------------------
+
+st.caption(
+    "این ابزار برای تحلیل و سناریوسازی است و "
+    "قیمت آینده را تضمین نمی‌کند."
+)
